@@ -46,7 +46,7 @@ def main():
 
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--trials_for_same_setting', type=int, default=10)
-    parser.add_argument('--epochs_range', type=int, default=10)
+    parser.add_argument('--epochs_range', type=int, default=15)
     parser.add_argument('--retrieval_method', type=str, default='None', choices=['None', 'top_1', 'top_k'])
 
     args = parser.parse_args()
@@ -92,7 +92,7 @@ def main():
             ]
             training_annotated_results.append(id_text_label)
 
-    testing_annotated_results = []
+    validation_annotated_results = []
     with open('fin.rag/annotation/annotated_result/all/aggregate_test.jsonl', 'r') as file:
         for line in file:
             data = json.loads(line)
@@ -102,6 +102,19 @@ def main():
                 data['tokens'],
                 data['naive_aggregation']['label'],
                 data['highlight_probs']
+            ]
+            validation_annotated_results.append(id_text_label)
+
+    testing_annotated_results = []
+    with open('fin.rag/annotation/annotated_result/all/expert_annotated_test.jsonl', 'r') as file:
+        for line in file:
+            data = json.loads(line)
+            key = list(data.keys())[0]
+            id_text_label = [
+                key,
+                data[key]['text'],
+                data[key]['tokens'],
+                data[key]['binary_labels']
             ]
             testing_annotated_results.append(id_text_label)
 
@@ -113,7 +126,8 @@ def main():
 
 
     for i in range(args.epochs_range):
-        f1_for_each_epoch = []
+        f1_for_each_epoch_valid = []
+        f1_for_each_epoch_testing = []
         for k in range(args.trials_for_same_setting):
 
             # Extract embeddings and texts
@@ -221,6 +235,93 @@ def main():
             retriever.eval()
             model.eval()
 
+            for valid_element in validation_annotated_results:
+                count += 1
+                #print(f'{count}')
+
+                query_firm_name = cik_to_name[valid_element[0].split('_')[2]]
+                concat_text = f"{query_firm_name} {valid_element[1]}"
+
+                # Embed the query text
+                query_embedding = embed_texts_contriever2(concat_text, retriever, tokenizer, device)
+                query_embedding = F.normalize(query_embedding, p=2, dim=1)
+                
+                query_embedding = query_embedding.to(device)  # Shape: (1, embedding_dim)
+                all_doc_embeddings = all_doc_embeddings.to(device)
+
+                # Compute similarities (dot product)
+                similarities = torch.matmul(all_doc_embeddings, query_embedding.t()).squeeze()  # Shape: (num_docs,)
+
+                topk_values, topk_indices = torch.topk(similarities, 2)
+
+                tokenized_ids = tokenizer.convert_tokens_to_ids(valid_element[2])
+                tokenized_stringA = torch.tensor(tokenized_ids).unsqueeze(0).to(device)
+                if args.retrieval_method in ['top_1', 'top_k']:
+                    tokenized_stringB = tokenizer.encode(final_texts[topk_indices[1]], add_special_tokens=False, return_tensors="pt").to(device)
+
+                # Truncate sequences if necessary
+                tokenized_stringA = tokenized_stringA[:, :250] if tokenized_stringA.size(1) > 250 else tokenized_stringA
+                if args.retrieval_method in ['top_1', 'top_k']:
+                    tokenized_stringB = tokenized_stringB[:, :250] if tokenized_stringB.size(1) > 250 else tokenized_stringB
+                
+                # Prepare combined input for the model
+                sep_token_id = tokenizer.sep_token_id
+                sep_token_tensor = torch.tensor([[sep_token_id]]).to(device)
+                if args.retrieval_method == 'None':
+                    combined_tokenized_string = torch.cat((tokenized_stringA, sep_token_tensor), dim=1).to(device)
+                elif args.retrieval_method in ['top_1', 'top_k']:
+                    combined_tokenized_string = torch.cat((tokenized_stringA, sep_token_tensor, tokenized_stringB), dim=1).to(device)
+                attention_mask = torch.ones(combined_tokenized_string.shape, dtype=torch.long).to(device)
+                
+                with torch.no_grad():
+                    # Get model outputs
+                    inputs = {"input_ids": combined_tokenized_string, "attention_mask": attention_mask}
+                    outputs = model(**inputs)
+                    logits = outputs.logits
+                    
+                    # Calculate probabilities before the separator token
+                    sep_index = (combined_tokenized_string == sep_token_id).nonzero(as_tuple=True)[1].item()
+                    logits_before_sep = logits[:, :sep_index, :]
+                    probabilities_label_1 = torch.sigmoid(logits_before_sep)[0, :, 1]
+                    
+                    binary_tensor = (probabilities_label_1 >= 0.5).float()
+                    true_label_tensor = torch.tensor(valid_element[3]).to(device)[:250]
+                    
+                    # Calculate True Positives (TP)
+                    TP = torch.sum((binary_tensor == 1) & (true_label_tensor == 1)).item()
+
+                    # Calculate False Positives (FP)
+                    FP = torch.sum((binary_tensor == 1) & (true_label_tensor == 0)).item()
+
+                    # Calculate False Negatives (FN)
+                    FN = torch.sum((binary_tensor == 0) & (true_label_tensor == 1)).item()
+
+                    # Calculate Precision
+                    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+
+                    # Calculate Recall
+                    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+
+                    # Calculate F1 Score
+                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                    total_precision += precision
+                    total_recall += recall
+                    total_f1 += f1_score
+
+            f1_for_each_epoch_valid.append(total_f1 / len(validation_annotated_results))
+
+
+
+
+            total_precision = 0
+            total_recall = 0
+            total_f1 = 0
+            count = 0
+
+            retriever.eval()
+            model.eval()
+
             for testing_element in testing_annotated_results:
                 count += 1
                 #print(f'{count}')
@@ -295,11 +396,16 @@ def main():
                     total_recall += recall
                     total_f1 += f1_score
 
-            f1_for_each_epoch.append(total_f1 / len(testing_annotated_results))
+            f1_for_each_epoch_testing.append(total_f1 / len(testing_annotated_results))
         
-        averageF1 = round(sum(f1_for_each_epoch) / len(f1_for_each_epoch), 4)
-        stdF1 = round(statistics.stdev(f1_for_each_epoch), 4)
-        print(f'Train for {i + 1} epochs: Average F1 is {averageF1}, SD is {stdF1}')
+        
+        averageF1_valid = round(sum(f1_for_each_epoch_valid) / len(f1_for_each_epoch_valid), 4)
+        stdF1_valid = round(statistics.stdev(f1_for_each_epoch_valid), 4)
+
+        averageF1_testing = round(sum(f1_for_each_epoch_testing) / len(f1_for_each_epoch_testing), 4)
+        stdF1_testing = round(statistics.stdev(f1_for_each_epoch_testing), 4)
+
+        print(f'Train for {i + 1} epochs: Average F1 for Validation is {averageF1_valid}, SD for Validation is {stdF1_valid}.  Average F1 for Testing is {averageF1_testing}, SD for Testing is {stdF1_testing}')
 
 
 if __name__ == "__main__":
